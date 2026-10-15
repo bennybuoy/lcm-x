@@ -23,6 +23,7 @@ from .db_bootstrap import (
     select_conversation_range,
     ExternalContentFtsSpec,
     add_column_if_missing,
+    backfill_tool_names,
     configure_connection,
     ensure_external_content_fts,
     ensure_message_stem_fts,
@@ -378,6 +379,7 @@ class MessageStore:
         self._ensure_source_column()
         self._ensure_conversation_id_column()
         self._ensure_time_contract_columns()
+        backfill_tool_names(self._conn)
         self._conn.commit()
         # False: a busy writer deferred stem init, so this handle reads only the plain index.
         self._stem_usable = ensure_message_stem_fts(self._conn, build_message_stem_fts_spec())
@@ -494,7 +496,7 @@ class MessageStore:
                     _normalize_content_value(msg.get("content")),
                     msg.get("tool_call_id"),
                     tc_json,
-                    msg.get("tool_name"),
+                    (msg.get("tool_name") or msg.get("name")) if msg.get("role") == "tool" else msg.get("tool_name"),
                     ingested_at,
                     token_estimate,
                     0,
@@ -580,7 +582,7 @@ class MessageStore:
                         _normalize_content_value(msg.get("content")),
                         msg.get("tool_call_id"),
                         tc_json,
-                        msg.get("tool_name"),
+                        (msg.get("tool_name") or msg.get("name")) if msg.get("role") == "tool" else msg.get("tool_name"),
                         ts,
                         est,
                         0,

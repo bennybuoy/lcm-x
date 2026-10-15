@@ -20,6 +20,7 @@ from contextlib import closing, contextmanager
 from typing import Iterable, Sequence
 
 from .config import sqlite_mmap_size
+from .sqlite_util import _sqlite_savepoint
 
 logger = logging.getLogger(__name__)
 _wal_reset_warned = False  # no lock: a rare duplicate warning beats a lock a forked child could inherit held
@@ -839,6 +840,66 @@ def ensure_message_origin_columns(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_msg_conversation_session ON messages(conversation_id, session_id, store_id)"
     )
+
+
+def backfill_tool_names(conn: sqlite3.Connection) -> None:
+    """Repair legacy empty names from the nearest preceding call in the same origin.
+
+    This named data migration leaves the schema version unchanged so rollback
+    readers also see the recovered identity. The marker and name updates share
+    a savepoint; claiming the marker first serializes concurrent initializers.
+    Unmatched rows stay untouched, never wildcard-match another tool.
+    """
+    step = "messages_tool_name_backfill_v1"
+    if conn.execute(
+        "SELECT 1 FROM lcm_migration_state WHERE step_name = ?", (step,)
+    ).fetchone():
+        return
+    with _sqlite_savepoint(conn):
+        claimed = conn.execute(
+            """INSERT INTO lcm_migration_state(step_name, completed_at)
+               VALUES (?, strftime('%s','now')) ON CONFLICT(step_name) DO NOTHING""",
+            (step,),
+        )
+        if not claimed.rowcount:
+            return
+        session = None
+        latest = {}
+        # Stream in session order: linear work, retaining only one session's
+        # call identities, without loading message content or per-row searches.
+        rows = conn.execute(
+            """SELECT store_id, session_id, source, conversation_id, role,
+                      tool_call_id, tool_calls, tool_name
+               FROM messages WHERE role IN ('assistant', 'tool')
+               ORDER BY session_id, store_id"""
+        )
+        for store_id, session_id, source, conversation_id, role, call_id, calls, name in rows:
+            if session_id != session:
+                latest.clear()
+                session = session_id
+            origin = (source or "", conversation_id or "")
+            if role == "assistant":
+                try:
+                    calls = json.loads(calls) if calls else []
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(calls, list):
+                    continue
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    key = str(call.get("id") or call.get("tool_call_id") or "").strip()
+                    function = call.get("function")
+                    if key:
+                        latest[(*origin, key)] = str(function.get("name") or "") if isinstance(function, dict) else ""
+            elif not name:
+                key = str(call_id or "").strip()
+                expected = latest.get((*origin, key)) if key else None
+                if expected:
+                    conn.execute(
+                        "UPDATE messages SET tool_name = ? WHERE store_id = ?",
+                        (expected, store_id),
+                    )
 
 
 def ensure_temporal_rollup_tables(conn: sqlite3.Connection) -> None:
