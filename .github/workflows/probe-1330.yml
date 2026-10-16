@@ -26,6 +26,8 @@ jobs:
         run: |
           pwd
           git rev-parse HEAD
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gdb
           python -m pip install -r requirements-semantic.txt fastembed==0.8.0 onnxruntime==1.31.0 numpy py-spy
           python -m pip freeze > probe-versions.txt
       - uses: actions/cache@v4
