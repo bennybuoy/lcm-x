@@ -76,6 +76,8 @@ for variant in ('normal', 'off'):
                             stdout=stack, stderr=subprocess.STDOUT, timeout=30)
                     except subprocess.TimeoutExpired:
                         stack.write('\nGDB_TIMEOUT\n')
+                    except OSError as exc:
+                        stack.write('\nGDB_UNAVAILABLE: ' + str(exc) + '\n')
         lines = stderr.read_text(errors='replace').splitlines()
         row = {'keys': 'on' if variant == 'normal' else 'off', 'repeat': repeat,
             'exit_wall_s': None if turn_end is None else round(end - turn_end, 4),
