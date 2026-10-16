@@ -1,0 +1,52 @@
+name: Probe 1330 Linux exit
+on:
+  push:
+    branches: [probe/1330-linux-exit]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      FASTEMBED_CACHE_PATH: ${{ github.workspace }}/probe-model-cache
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '2'
+      TOKENIZERS_PARALLELISM: 'false'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Install runtime and diagnostic dependencies
+        run: |
+          pwd
+          git rev-parse HEAD
+          python -m pip install -r requirements-semantic.txt fastembed==0.8.0 onnxruntime==1.31.0 numpy py-spy
+          python -m pip freeze > probe-versions.txt
+      - uses: actions/cache@v4
+        with:
+          path: probe-model-cache
+          key: probe-1330-bge-small-en-v15-fastembed080-ort1310-linux-x64-v1
+      - name: Download the synthetic-probe model with fastembed
+        run: |
+          python -c "import os; from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-en-v1.5', cache_dir=os.environ['FASTEMBED_CACHE_PATH'], threads=2)"
+      - name: Ten serial engine exits with host lifecycle replay
+        run: |
+          sudo sysctl -w kernel.core_pattern=core.%p
+          ulimit -c unlimited
+          nice -n 19 python -B probe/1330/driver.py linux-r2
+      - name: Upload all probe receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-1330-linux-r2
+          path: |
+            linux-r2/
+            probe-versions.txt
+          retention-days: 30
+          include-hidden-files: true
