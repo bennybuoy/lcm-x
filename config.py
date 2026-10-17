@@ -730,6 +730,7 @@ ENV_FIELD_SPECS: tuple[_EnvFieldSpec, ...] = (
     _EnvFieldSpec("rollup_maintenance_budget_ms", "LCM_ROLLUP_MAINTENANCE_BUDGET_MS", int),
     _EnvFieldSpec("background_leaf_prep_enabled", "LCM_BACKGROUND_LEAF_PREP_ENABLED", bool),
     _EnvFieldSpec("background_leaf_prep_max_calls", "LCM_BACKGROUND_LEAF_PREP_MAX_CALLS", int),
+    _EnvFieldSpec("background_leaf_prep_pressure_ratio", "LCM_BACKGROUND_LEAF_PREP_PRESSURE_RATIO", float),
     _EnvFieldSpec("background_leaf_prep_window_s", "LCM_BACKGROUND_LEAF_PREP_WINDOW_S", float),
 )
 
@@ -1187,6 +1188,7 @@ class LCMConfig:
     summary_prompt_version: int = 1
     # #787 slice 1: prepare leaf summaries off-turn and publish them at the threshold crossing (default off).
     background_leaf_prep_enabled: bool = False
+    background_leaf_prep_pressure_ratio: float = 0.8
     # #787: the background preparation's own spend guard: at most this many summariser calls per window.
     background_leaf_prep_max_calls: int = 8
     background_leaf_prep_window_s: float = 600.0

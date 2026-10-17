@@ -582,6 +582,9 @@ class CompactionMixin:
         if thread_context is not None:
             thread_context.foreground_budget = budget
         returned = None
+        prep_store = str(self._store.db_path) if self._config.background_leaf_prep_enabled else None
+        if prep_store is not None:
+            leaf_prep._LEAF_PREP.foreground(prep_store, 1)
         try:
             budget.pre_leaf = PhaseSqlTrace()  # #1127: timed until the first leaf call, or the stop before one
             budget.pre_leaf.install([(self._store, "_conn"), (self._store, "_write_lock"), (self._dag, "_conn"),
@@ -681,6 +684,8 @@ class CompactionMixin:
                     return fitted
             raise
         finally:
+            if prep_store is not None:
+                leaf_prep._LEAF_PREP.foreground(prep_store, -1)
             self._end_pre_leaf_phase(budget, "stopped")
             self._last_compress_leaves = (self._hold_conversation_key(), budget.leaves)
             self._compress_forced_overflow = False
@@ -1236,10 +1241,24 @@ class CompactionMixin:
     def _prepared_leaf_revalidation(self, leaf):
         """#787 (D-4): inside the publication transaction the covered rows and the route must be unchanged."""
         def revalidate(conn) -> None:
+            if leaf.binding_fingerprint != leaf_prep.binding_fingerprint(
+                    self._hermes_home, self._store.db_path, self.threshold_tokens,
+                    self.context_length, int(self._effective_fresh_tail_max_tokens())):
+                raise leaf_prep.PromotionRejected("binding_changed")
+            current = conn.execute(
+                "SELECT current_session_id, current_frontier_store_id FROM lcm_lifecycle_state "
+                "WHERE conversation_id=?", (leaf.conversation_id,),
+            ).fetchone()
+            if current is None or tuple(current) != (leaf.session_id, leaf.start_frontier):
+                raise leaf_prep.PromotionRejected("frontier_moved")
             if leaf_prep.route_fingerprint(self._config) != leaf.route_fingerprint:
                 raise leaf_prep.PromotionRejected("route_fingerprint_mismatch")
             if leaf_prep.committed_coverage_digest(conn, leaf.covered_store_ids) != leaf.coverage_digest:
                 raise leaf_prep.PromotionRejected("coverage_digest_mismatch")
+            from .leaf_prep_store import stage_settlement
+            if not stage_settlement(conn, leaf.claim_token, self._conversation_id,
+                                    self._session_id, leaf.start_frontier):
+                raise leaf_prep.PromotionRejected("stale_evicted")
         return revalidate
 
     def _fail_open_after_publication_failure(
@@ -1902,7 +1921,7 @@ class CompactionMixin:
             )
 
         # #787 (amendment M-1): a leaf pass whose chunk matches a prepared leaf publishes it without the call
-        prep_enabled = bool(getattr(self._config, "background_leaf_prep_enabled", False))
+        prep_enabled = bool(getattr(self._config, "background_leaf_prep_enabled", False)) and not explicit_focus_topic
         promoted_leaves = prep_freed = prep_low_water = 0
         no_call_only, refused_input = False, None
         self._pre_leaf_span("pre_loop", budget.t0)
@@ -2488,7 +2507,9 @@ class CompactionMixin:
             leaf_passes += 1
             if prepared is not None:  # #787: a promoted pass spends no summariser pass
                 leaf_prep.promoted(str(self._store.db_path), self._conversation_id, prepared)
-                promoted_leaves, max_leaf_passes = promoted_leaves + 1, max_leaf_passes + 1
+                promoted_leaves += 1
+                if threshold_full_sweep_active:
+                    max_leaf_passes += 1
                 prep_freed += count_messages_tokens(source_lookup_chunk) - count_tokens(summary_text)
             level3_leaves += _level == 3
             estimated_active_tokens = max(0, estimated_active_tokens - source_tokens + summary_tokens)

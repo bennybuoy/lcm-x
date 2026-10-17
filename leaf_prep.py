@@ -7,10 +7,12 @@ read-only SQLite connection, reads the owned rows above the durable frontier (ne
 the foreground would exclude: it stops before one), and summarises one chunk per leaf through the foreground's
 summariser with that snapshot, its own breaker keys (``prep:``), its own spend guard and no foreground budget.
 
-Prepared leaves live in a bounded in-memory cache. At the crossing, compress() promotes the longest chain that
-starts at the durable frontier through the fenced publication, re-checking each leaf's coverage digest and route
-fingerprint inside the publication transaction; a rejected leaf ends the chain and the foreground path runs as
-before. A restart, a shutdown or a storage rebind loses the cache; nothing durable is written off-turn.
+Prepared leaves are private, bounded, restart-readable rows in the LCM database,
+not canonical nodes. One leaf per conversation is claimed with an expiring owner
+token. At a normal crossing, the leaf loop validates its occurrence mapping and
+publishes through the existing DAG/lifecycle transaction, including settlement
+of the ready row. A rejection falls back to foreground work. Shutdown revokes
+only the caller's jobs; an in-flight request owns its connection until it exits.
 """
 
 from __future__ import annotations
@@ -23,11 +25,13 @@ import logging
 import re
 import sqlite3
 import threading
+import time
 from collections import Counter, OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import leaf_prep_store
 from .config import hermes_auxiliary_compression_max_concurrency
 from .db_bootstrap import select_conversation_range
 from .fresh_tail import resolve_fresh_tail_boundary
@@ -50,9 +54,16 @@ REJECT_REASONS = (
     "stale_evicted",
 )
 ROUTE_KEY_PREFIX = "prep:"
-_PER_CONVERSATION = 16
+_PER_CONVERSATION = 1
 _PER_PROCESS = 64
 _SCAN_LIMIT = 2000
+_SCAN_BYTES = 4_000_000
+_ROW_BYTES = " + ".join(
+    "COALESCE(length(CAST(" + name.strip() + " AS BLOB)), 0)"
+    for name in (
+        "session_id,source,role,content,tool_call_id,tool_calls,tool_name,conversation_id,observed_at_source"
+    ).split(",")
+)
 _MIN_FOREGROUND_SLOTS = 2
 _ROW_COLUMNS = (
     "store_id, session_id, source, role, content, tool_call_id, "
@@ -82,6 +93,8 @@ class PreparedLeaf:
     model: str
     source_tokens: int
     summary_tokens: int
+    binding_fingerprint: str = ""
+    claim_token: str = ""
     excluded_store_ids: tuple = ()  # stored system prompts between the start frontier and the first covered row
 
     @property
@@ -107,11 +120,23 @@ class _Job:
     breaker: Any
     foreground_guard: Any
     context: contextvars.Context = field(repr=False)
+    cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
     dependent_records: tuple = ()  # the session's marked ignored-dependent replies, read at enqueue
 
     @property
     def key(self) -> tuple:
         return (self.db_path, self.conversation_id)
+
+
+def binding_fingerprint(home, db_path, threshold, window, tail_tokens) -> str:
+    values = [
+        str(Path(home).resolve()),
+        str(Path(db_path).resolve()),
+        threshold,
+        window,
+        tail_tokens,
+    ]
+    return hashlib.sha256(json.dumps(values).encode()).hexdigest()
 
 
 def route_fingerprint(config) -> str:
@@ -137,29 +162,60 @@ def route_fingerprint(config) -> str:
             "sensitive_patterns",
         )
     ]
-    payload = json.dumps(values, ensure_ascii=False, separators=(",", ":"), default=str)
+    # Conservative policy fence: tail, filters, serializer and future config
+    # fields cannot silently evade a hand-maintained summary-only allowlist.
+    values.append(asdict(config))
+    payload = json.dumps(
+        ["leaf-policy-v1", values],
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def coverage_digest(rows) -> str:
-    """sha256 over the covered rows' (store_id, content) in store order (the reconcile.py:439 idiom)."""
-    pairs = sorted([int(store_id), content] for store_id, content in rows)
+    """Versioned identity of every durable input field, including structured tool metadata.
+
+    Hash decoded rows on both sides, not just display text. This is occurrence
+    validation, never content-based deduplication.
+    """
+    fields = [name.strip() for name in _ROW_COLUMNS.split(",")]
+    values = [[row.get(name) for name in fields] for row in rows]
+    values.sort(key=lambda row: row[0])
     return hashlib.sha256(
-        json.dumps(pairs, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        json.dumps(
+            ["leaf-source-v1", values],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
     ).hexdigest()
 
 
 def committed_coverage_digest(conn: sqlite3.Connection, store_ids) -> Optional[str]:
     """The digest of the rows as ``conn`` sees them; None when one is missing."""
     ids = sorted({int(store_id) for store_id in store_ids})
+    if not ids or len(ids) > _SCAN_LIMIT:
+        return None
+    sizes = conn.execute(
+        "SELECT " + _ROW_BYTES + " FROM messages WHERE store_id IN "
+        "(SELECT value FROM json_each(?))",
+        (json.dumps(ids),),
+    ).fetchall()
+    if len(sizes) != len(ids) or sum(row[0] for row in sizes) > _SCAN_BYTES:
+        return None
     rows = conn.execute(
-        "SELECT m.store_id, m.content FROM json_each(?) AS source CROSS JOIN messages AS m "
+        "SELECT "
+        + ", ".join("m." + name.strip() for name in _ROW_COLUMNS.split(","))
+        + " FROM json_each(?) AS source CROSS JOIN messages AS m "
         "WHERE m.store_id = source.value ORDER BY m.store_id",
         (json.dumps(ids),),
     ).fetchall()
     if [int(row[0]) for row in rows] != ids:
         return None
-    return coverage_digest(rows)
+    return coverage_digest(_decode_row(row) for row in rows)
 
 
 def working_leaf_chunk_tokens(config, context_length: int, raw_tokens: int) -> int:
@@ -300,6 +356,28 @@ def _summary_input(
     return redacted
 
 
+class _ClaimSpendGuard:
+    """Every fallback/rescue attempt is charged to the shared private budget."""
+
+    def __init__(self, job, token, guard):
+        self.job, self.token, self.guard = job, token, guard
+
+    def try_record_call(self):
+        job = self.job
+        return (
+            not job.cancelled.is_set()
+            and not _LEAF_PREP.foreground(job.db_path)
+            and self.guard.allows()
+            and leaf_prep_store.reserve_call(
+                job.db_path,
+                self.token,
+                job.config.background_leaf_prep_max_calls,
+                job.config.background_leaf_prep_window_s,
+            )
+            and self.guard.try_record_call()
+        )
+
+
 class _LeafPrep:
     """The process-wide queue, worker, cache and counters."""
 
@@ -314,8 +392,19 @@ class _LeafPrep:
         # one worker spend guard per profile (Hermes home, store), kept across other profiles' jobs
         self._spend_guards: "OrderedDict[tuple, tuple]" = OrderedDict()
         self.counters: Counter = Counter()
+        self._foreground: Counter = Counter()
 
     # -- turn thread ---------------------------------------------------------------------------------------
+
+    def foreground(self, db_path, delta=0):
+        with self._condition:
+            key = str(Path(db_path).resolve())
+            value = self._foreground[key] + delta
+            if value:
+                self._foreground[key] = value
+            else:
+                self._foreground.pop(key, None)
+            return value > 0
 
     def generation(self, db_path: str) -> int:
         with self._condition:
@@ -328,6 +417,9 @@ class _LeafPrep:
             if self._jobs.pop(job.key, None) is not None:
                 self.counters["jobs_superseded"] += 1
             self._jobs[job.key] = job
+            while len(self._jobs) > _PER_PROCESS:
+                self._jobs.popitem(last=False)
+                self.counters["jobs_dropped"] += 1
             self.counters["jobs_enqueued"] += 1
             if self._worker is None or not self._worker.is_alive():
                 self._worker = threading.Thread(
@@ -353,7 +445,12 @@ class _LeafPrep:
     ) -> List[PreparedLeaf]:
         """The cached chain starting at ``frontier``; leaves no longer reachable from it are dropped."""
         key = (str(db_path), conversation_id)
+        payload = leaf_prep_store.load(db_path, conversation_id, frontier)
         with self._condition:
+            if payload is not None:
+                payload["covered_store_ids"] = tuple(payload["covered_store_ids"])
+                payload["excluded_store_ids"] = tuple(payload["excluded_store_ids"])
+                self._cache[key] = [PreparedLeaf(**payload)]
             leaves = self._cache.get(key)
             if not leaves:
                 return []
@@ -366,9 +463,11 @@ class _LeafPrep:
             stale = [leaf for leaf in leaves if leaf not in chain]
             if stale:
                 self._remove_locked(key, stale, "frontier_moved")
-            return chain
+            return chain if payload is not None else []
 
     def reject(self, db_path: str, conversation_id: str, leaves, reason: str) -> None:
+        for leaf in leaves:
+            leaf_prep_store.drop(db_path, leaf.claim_token)
         with self._condition:
             self._remove_locked((str(db_path), conversation_id), list(leaves), reason)
 
@@ -451,7 +550,7 @@ class _LeafPrep:
 
     def _current(self, job: _Job, conn: sqlite3.Connection) -> bool:
         """The job's binding and frontier still hold, and no shutdown/rebind intervened."""
-        if self.generation(job.db_path) != job.generation:
+        if job.cancelled.is_set() or self.generation(job.db_path) != job.generation:
             return False
         row = conn.execute(
             "SELECT current_session_id, current_frontier_store_id FROM lcm_lifecycle_state WHERE conversation_id = ?",
@@ -506,7 +605,11 @@ class _LeafPrep:
         return kept[1]
 
     def _prepare(self, job: _Job) -> None:
-        if self.generation(job.db_path) != job.generation:
+        if (
+            job.cancelled.is_set()
+            or self.generation(job.db_path) != job.generation
+            or self.foreground(job.db_path)
+        ):
             return
         if (
             hermes_auxiliary_compression_max_concurrency(job.hermes_home) == 1
@@ -535,15 +638,33 @@ class _LeafPrep:
         config = job.config
         if not self._current(job, conn):
             return
-        raw = select_conversation_range(
-            conn,
-            _ROW_COLUMNS,
-            job.session_id,
-            job.conversation_id,
-            job.frontier,
-            None,
-            _SCAN_LIMIT,
-        )
+        # Size admission and payload read share a frozen snapshot, released
+        # before any claim write or network work. Limits apply before Python
+        # materializes source payloads, not after fetchall/json.loads.
+        conn.execute("BEGIN")
+        try:
+            sizes = select_conversation_range(
+                conn,
+                _ROW_BYTES,
+                job.session_id,
+                job.conversation_id,
+                job.frontier,
+                None,
+                _SCAN_LIMIT,
+            )
+            if len(sizes) >= _SCAN_LIMIT or sum(row[0] for row in sizes) > _SCAN_BYTES:
+                return
+            raw = select_conversation_range(
+                conn,
+                _ROW_COLUMNS,
+                job.session_id,
+                job.conversation_id,
+                job.frontier,
+                None,
+                _SCAN_LIMIT,
+            )
+        finally:
+            conn.rollback()
         if len(raw) >= _SCAN_LIMIT:
             return  # the newest rows (the fresh tail) were not read
         rows = [_decode_row(row) for row in raw]
@@ -565,7 +686,11 @@ class _LeafPrep:
             config, job.context_length, count_messages_tokens(messages)
         )
         bounds = levels(job.threshold_tokens, job.context_length, chunk_tokens)
-        if bounds is None or job.tokens < bounds[0]:
+        if (
+            bounds is None
+            or job.tokens
+            < job.threshold_tokens * config.background_leaf_prep_pressure_ratio
+        ):
             return
         need = (
             job.tokens - bounds[1] + chunk_tokens
@@ -578,15 +703,14 @@ class _LeafPrep:
                 int(row["store_id"])
                 for row in rows[position : position + len(leaf.covered_store_ids)]
             ]
-            current = coverage_digest(
-                (row["store_id"], row.get("content"))
-                for row in rows[position : position + len(covered)]
-            )
+            current = coverage_digest(rows[position : position + len(covered)])
             if (
                 tuple(covered) != leaf.covered_store_ids
                 or current != leaf.coverage_digest
                 or leaf.route_fingerprint != job.fingerprint
             ):
+                for stale in chain[index:]:
+                    leaf_prep_store.drop(job.db_path, stale.claim_token)
                 with self._condition:
                     self.counters["wasted"] += len(chain) - index
                     self._remove_locked(job.key, chain[index:], None)
@@ -635,14 +759,22 @@ class _LeafPrep:
             ):  # D-7: one worker model call per process
                 return
             try:
-                if self.generation(job.db_path) != job.generation:
+                token = leaf_prep_store.claim(
+                    job.db_path, job.conversation_id, job.session_id, job.frontier
+                )
+                if token is None:
+                    return
+                if (
+                    job.cancelled.is_set()
+                    or self.generation(job.db_path) != job.generation
+                ):
                     return
                 result = summarize_leaf_chunk_with_rescue(
                     chunk,
                     config=config,
                     focus_topic=job.focus_topic,
                     circuit_breaker=job.breaker,
-                    spend_guard=guard,
+                    spend_guard=_ClaimSpendGuard(job, token, guard),
                     serialize=lambda batch, budget_tokens=None: _serialize_leaf_input(
                         batch,
                         config=config,
@@ -664,6 +796,7 @@ class _LeafPrep:
                     ),
                     retry_worthy=_is_retry_worthy_leaf_summary_error,
                     route_key_prefix=ROUTE_KEY_PREFIX,
+                    deadline=time.monotonic() + 120.0,
                 )
             except LeafPrepUnavailable:
                 return
@@ -685,11 +818,17 @@ class _LeafPrep:
                 session_id=job.session_id,
                 conversation_id=job.conversation_id,
                 start_frontier=start,
+                claim_token=token,
+                binding_fingerprint=binding_fingerprint(
+                    job.hermes_home,
+                    job.db_path,
+                    job.threshold_tokens,
+                    job.context_length,
+                    job.fresh_tail_max_tokens,
+                ),
                 covered_store_ids=tuple(int(row["store_id"]) for row in covered_rows),
                 excluded_store_ids=() if chain else anchors,
-                coverage_digest=coverage_digest(
-                    (row["store_id"], row.get("content")) for row in covered_rows
-                ),
+                coverage_digest=coverage_digest(covered_rows),
                 route_fingerprint=job.fingerprint,
                 summary=result.summary,
                 level=result.level,
@@ -699,6 +838,8 @@ class _LeafPrep:
             )
             if not self._current(job, conn):
                 return  # D-9: the binding or frontier moved while the call ran
+            if not leaf_prep_store.finish(job.db_path, token, asdict(leaf)):
+                return
             if not self._cache_leaf(job, leaf):
                 return
             chain.append(leaf)
@@ -779,7 +920,8 @@ def enqueue_after_turn(engine, history) -> bool:
         int(engine.context_length or 0),
     )
     tokens = int(engine.last_prompt_tokens or 0)
-    if threshold <= 0 or window <= 0 or tokens < threshold - 0.15 * window:
+    ratio = engine._config.background_leaf_prep_pressure_ratio
+    if threshold <= 0 or window <= 0 or not 0 < ratio < 1 or tokens < threshold * ratio:
         return False  # below P: nothing to prepare yet
     state = engine._lifecycle.get_by_conversation(engine._conversation_id)
     if (
@@ -788,7 +930,9 @@ def enqueue_after_turn(engine, history) -> bool:
     ):
         return False
     db_path = str(engine._store.db_path)
-    config = copy.copy(engine._config)
+    config = copy.deepcopy(engine._config)
+    if getattr(engine, "_leaf_prep_cancelled", None) is None:
+        engine._leaf_prep_cancelled = threading.Event()
     recent = engine._redact_active_replay_messages(list(history or [])[-64:])
     job = _Job(
         db_path=db_path,
@@ -808,6 +952,7 @@ def enqueue_after_turn(engine, history) -> bool:
         breaker=engine._summary_circuit_breaker,
         foreground_guard=engine._summary_spend_guard,
         context=contextvars.copy_context(),
+        cancelled=engine._leaf_prep_cancelled,
         dependent_records=tuple(
             engine._load_generated_ignored_dependent_reply_records()
         ),

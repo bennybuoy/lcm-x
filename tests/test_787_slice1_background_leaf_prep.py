@@ -219,44 +219,24 @@ def test_off_starts_no_thread_enqueues_nothing_and_never_promotes(
 def test_prepared_leaves_publish_at_the_crossing_with_no_model_call(
     engine, provider, _isolated
 ):
+    # Single-pass crossing: unprepared sweep remainder is covered separately.
+    engine._config.threshold_full_sweep_enabled = False
     view = _crossing_view(engine)
     _turn_end(engine, view)
-    prepared = _isolated.counters["prepared"]
-    assert (
-        prepared >= 4
-        and provider.on("lcm-leaf-prep") == prepared
-        and provider.on("MainThread") == 0
-    )
-
-    host_tokens = tokens.count_messages_tokens(view)
-    result = engine.compress(view, current_tokens=host_tokens)
-
-    assert provider.on("MainThread") == 0  # 0 summariser calls on the turn
+    assert _isolated.counters["prepared"] == provider.on("lcm-leaf-prep") == 1
+    result = engine.compress(view, current_tokens=tokens.count_messages_tokens(view))
+    assert provider.on("MainThread") == 0
     leaves = _leaf_sources(engine)
-    assert len(leaves) == _isolated.counters["promoted"] >= 4
-    assert engine.last_compression_status == "compacted"
-    sweep = engine._last_threshold_full_sweep
-    assert sweep["stop_reason"] == "prepared_leaves_promoted" and sweep[
-        "promoted_leaves"
-    ] == len(leaves)
-    low_water = leaf_prep.levels(engine.threshold_tokens, engine.context_length, CHUNK)[
-        1
-    ]
-    freed = sum(
-        tokens.count_messages_tokens(view[1 + sum(map(len, leaves[:i])) :][: len(ids)])
-        for i, ids in enumerate(leaves)
-    )
-    assert host_tokens - freed + len(leaves) * tokens.count_tokens(SUMMARY) <= low_water
-    assert tokens.count_messages_tokens(result) < engine.threshold_tokens
+    assert len(leaves) == _isolated.counters["promoted"] == 1
     assert _frontier(engine) == leaves[-1][-1]
-    status = engine.get_status()["background_leaf_prep"]
-    assert status["promoted"] == len(leaves) and status["prepared"] == prepared
+    assert tokens.count_messages_tokens(result) < tokens.count_messages_tokens(view)
+    assert all(m in result for m in view[-2:])
 
 
 def _prepared(engine, _isolated, view) -> list:
     _turn_end(engine, view)
     chain = leaf_prep.ready_chain(engine._store.db_path, "conv", _frontier(engine))
-    assert len(chain) >= 4
+    assert len(chain) == 1
     return chain
 
 
@@ -561,7 +541,7 @@ def test_a_chain_whose_first_row_is_glued_into_the_summary_carrier_is_promoted(
     assert len(flat) == len(set(flat))
 
 
-def test_cache_bound_evicts_the_least_recently_used_conversation(
+def test_one_leaf_cache_keeps_profiles_separate(
     tmp_path, provider, _isolated, monkeypatch
 ):
     monkeypatch.setattr(leaf_prep, "_PER_PROCESS", 2)
@@ -570,10 +550,10 @@ def test_cache_bound_evicts_the_least_recently_used_conversation(
     try:
         _turn_end(first, _crossing_view(first))
         kept = _isolated.status()["cached_leaves"]
-        assert kept >= 2
+        assert kept == 1
         _turn_end(second, _crossing_view(second))
-        assert _isolated.counters["rejected_stale_evicted"] == kept
-        assert leaf_prep.ready_chain(first._store.db_path, "conv", 0) == []
+        assert _isolated.status()["cached_leaves"] == 2
+        assert leaf_prep.ready_chain(first._store.db_path, "conv", 0)
         assert leaf_prep.ready_chain(second._store.db_path, "conv", 0)
     finally:
         first.shutdown()
@@ -622,7 +602,7 @@ def test_promotion_then_foreground_never_covers_a_row_twice(
 
     sources = _leaf_sources(engine)
     flat = [store_id for ids in sources for store_id in ids]
-    assert len(flat) == len(set(flat)) and _isolated.counters["promoted"] >= 4
+    assert len(flat) == len(set(flat)) and _isolated.counters["promoted"] == 1
 
 
 # 5. budget isolation ---------------------------------------------------------------------------------------------
@@ -688,8 +668,8 @@ def test_worker_has_its_own_spend_guard(engine, provider, _isolated):
     engine._config.background_leaf_prep_max_calls = 2
     _turn_end(engine, _crossing_view(engine))
     assert (
-        provider.on("lcm-leaf-prep") == 2 and _isolated.counters["prepared"] == 2
-    )  # then the guard is spent
+        provider.on("lcm-leaf-prep") == 1 and _isolated.counters["prepared"] == 1
+    )  # one leaf prepared; foreground budget untouched
     assert (
         engine._summary_spend_guard.remaining()
         == engine._config.summary_spend_max_calls
@@ -852,7 +832,9 @@ def test_shutdown_and_rebind_clear_the_cache_and_discard_a_late_job(
     engine = _engine(tmp_path)
     view = _crossing_view(engine)
     _turn_end(engine, view)
-    assert _isolated.status()["cached_leaves"] >= 4
+    assert _isolated.status()["cached_leaves"] == 1
+    cached = leaf_prep.ready_chain(engine._store.db_path, "conv", 0)
+    leaf_prep.reject(engine._store.db_path, "conv", cached, "stale_evicted")
     started, release = threading.Event(), threading.Event()
 
     def hold_worker():
@@ -1090,7 +1072,7 @@ def test_r1_f1_promotion_needs_the_summary_source_as_well_as_the_consumption(
         raising=False,
     )
     view = _crossing_view(engine)
-    marker = "reply to T1 alpha"
+    marker = "reply to T0 alpha"
     reply = 1 + next(
         i for i, m in enumerate(view) if str(m.get("content")).startswith(marker)
     )
@@ -1125,7 +1107,7 @@ def test_r1_f1_promotion_needs_the_summary_source_as_well_as_the_consumption(
 def test_r1_f2_each_profile_keeps_its_worker_spend_guard_across_interleaved_jobs(
     tmp_path, provider, _isolated
 ):
-    first = _engine(tmp_path, background_leaf_prep_max_calls=2)
+    first = _engine(tmp_path, background_leaf_prep_max_calls=1)
     second = _engine(
         tmp_path / "b",
         database_path=str(tmp_path / "b.db"),
@@ -1134,10 +1116,12 @@ def test_r1_f2_each_profile_keeps_its_worker_spend_guard_across_interleaved_jobs
     try:
         view = _crossing_view(first)
         _turn_end(first, view)
-        assert provider.on("lcm-leaf-prep") == 2  # the first profile's window is spent
+        assert provider.on("lcm-leaf-prep") == 1  # the first profile's window is spent
         _turn_end(second, _crossing_view(second))  # another profile, another guard
         before = provider.on("lcm-leaf-prep")
-        assert before > 2
+        assert before == 2
+        cached = leaf_prep.ready_chain(first._store.db_path, "conv", 0)
+        leaf_prep.reject(first._store.db_path, "conv", cached, "stale_evicted")
         first.ingest(view + _view(60)[len(view) :])
         first.last_prompt_tokens = WINDOW  # far above L: the chain would grow
         first._prepare_leaves_after_turn(view)
@@ -1303,11 +1287,7 @@ def test_r2_b_a_full_table_of_live_guards_skips_the_new_profile(_isolated):
 # Review round 5: preserve the stop-bar evidence without changing opt-in policy.
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Accepted opt-in follow-up: D-4 permits preparation-time focus at promotion",
-)
-def test_r5_changed_focus_would_require_a_new_foreground_summary(
+def test_r5_changed_focus_uses_a_new_foreground_summary(
     engine, provider, _isolated, tmp_path
 ):
     old_focus, new_focus = "orchard-budget", "marina-layout"
@@ -1338,14 +1318,9 @@ def test_r5_changed_focus_would_require_a_new_foreground_summary(
     engine.compress(
         view, current_tokens=engine.threshold_tokens + CHUNK, focus_topic=new_focus
     )
-    assert _isolated.counters["promoted"] > 0
-    published = [
-        node for node in engine._dag.get_session_nodes("S", limit=100_000)
-        if node.source_ids == list(chain[0].covered_store_ids)
-    ]
-    assert len(published) == 1
-    # Expected RED: the current policy publishes old_summary despite the new focus.
-    assert published[0].summary == new_summary
+    assert _isolated.counters["promoted"] == 0
+    published = engine._dag.get_session_nodes("S", limit=100_000)
+    assert published and all(node.summary == new_summary for node in published)
 
 
 @pytest.mark.parametrize("field", ["role", "tool_call_id", "tool_calls", "tool_name"])

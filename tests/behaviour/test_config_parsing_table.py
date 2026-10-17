@@ -81,6 +81,7 @@ CONFIG_ROWS = (
     ('embedding_backfill_timeout_s', 'LCM_EMBEDDING_BACKFILL_TIMEOUT_S', 'float', 120.0),
     ('embedding_query_spend_window_seconds', 'LCM_EMBEDDING_QUERY_SPEND_WINDOW_SECONDS', 'float', 60.0),
     ('embedding_query_spend_backoff_seconds', 'LCM_EMBEDDING_QUERY_SPEND_BACKOFF_SECONDS', 'float', 60.0),
+    ('background_leaf_prep_pressure_ratio', 'LCM_BACKGROUND_LEAF_PREP_PRESSURE_RATIO', 'float', 0.8),
     ('background_leaf_prep_window_s', 'LCM_BACKGROUND_LEAF_PREP_WINDOW_S', 'float', 600.0),
     # config._parse_float_env_with_source -> LCMConfig.from_env (construction time).
     ('leaf_target_ratio', 'LCM_LEAF_TARGET_RATIO', 'float', 0.2),

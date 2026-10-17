@@ -2142,9 +2142,10 @@ class LCMEngine(
 
     def _discard_prepared_leaves(self) -> None:
         """#787: shutdown and storage rebind drop this store's queued preparations and prepared leaves."""
-        store = getattr(self, "_store", None)
-        if store is not None:
-            leaf_prep.discard(store.db_path)
+        cancelled = getattr(self, "_leaf_prep_cancelled", None)
+        if cancelled is not None:
+            cancelled.set()  # revoke only this engine's jobs, never another clone
+            self._leaf_prep_cancelled = None
 
     def _prepare_leaves_after_turn(self, history) -> None:
         """#787 (default off): after a completed turn's ingest, enqueue one background leaf preparation (O(1))."""
