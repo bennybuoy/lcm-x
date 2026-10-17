@@ -1,7 +1,7 @@
 name: Probe 1330 Linux exit
 on:
   push:
-    branches: [probe/1330-linux-exit]
+    branches: [probe/1330-linux-exit, probe/1330-linux-exit-fix]
   workflow_dispatch:
 permissions:
   contents: read
